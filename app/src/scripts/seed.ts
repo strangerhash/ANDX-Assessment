@@ -13,13 +13,14 @@ import {
   type Address,
 } from "viem";
 import { foundry } from "viem/chains";
-import { account } from "../lib/accounts.ts";
+import { account, assertFixtureAccounts } from "../lib/accounts.ts";
 import { escrowAbi, erc20Abi, nrtAbi } from "../lib/abi.ts";
 
 const RPC = process.env.ANVIL_RPC ?? "http://127.0.0.1:8545";
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../../..");
 
 async function main() {
+  assertFixtureAccounts();
   const dep = JSON.parse(readFileSync(join(ROOT, "deployments.json"), "utf8"));
   const fixtures = JSON.parse(readFileSync(join(ROOT, "fixtures/campaigns.json"), "utf8")) as {
     endTimeOffsetSeconds: number;

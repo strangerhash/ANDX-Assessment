@@ -6,24 +6,21 @@
 
 **Maximum loss per campaign (formula).** Let
 
-- `A = activeCommitted`
-- `N = netDeposited - refunded`
+- `A = activeCommitted` before the malicious root activates
+- `Q = claimedTotal` immediately before that activation (honest claims during the veto window reduce exposure)
+- `N = netDeposited - refunded` at proposal time
 - `M = maxCommitPerEpoch`
-- `ended = (block.timestamp >= endTime)`
+- `Δ` = commitment increase accepted for that proposal (`0` if at/after `endTime`)
 
-If `ended`, commitment cannot increase → **extra loss = 0** beyond amounts already activated for honest creators (those remain claimable). If not ended, one malicious epoch can raise commitment by at most `min(M, N - A)`. After activation, attacker-controlled leaves can claim up to that new commitment, subject to `claimedTotal <= activeCommitted`. So:
-
-\[
-L_{\text{one epoch}} = \min(M,\ N - A)
-\]
-
-With repeated epochs (if guardian never revokes), each epoch can add another `min(M, N - A')` until `A → N`. Absolute ceiling:
+A malicious operator can **reassign already-committed but still-unclaimed** entitlement to attacker leaves **without increasing commitment** (`Δ = 0`). Increase-only bounds are therefore incomplete. For one undetected malicious root:
 
 \[
-L_{\max} = N - A_{\text{honest already claimable}} \le N
+L \le (A - Q) + \Delta,\quad 0 \le \Delta \le \min(M,\ N - A)
 \]
 
-Honest creators with cumulatives already in an **active** root can still claim those amounts; the attacker cannot decrease `A` or steal already-claimed funds. Pending honest roots survive revoke (ADR-0001) but a malicious **pending** root can still activate unless vetoed.
+(with `Δ = 0` when the proposal is at or after `endTime`). The first term is reassignment of residual committed funds; the second is any permitted increase. Absolute ceiling over many epochs if never stopped remains `≤ N`.
+
+Honest creators can still claim under the **old active** root during `ROOT_DELAY`, shrinking `(A - Q)`. Pending honest roots survive revoke (ADR-0001) but a malicious **pending** root can still activate unless vetoed — revoke alone is not enough.
 
 **How fast must the guardian act?** Within **`ROOT_DELAY`** (here 3600s) of a malicious `RootProposed` to call `vetoRoot`, **or** immediately `revokeOperator` / `pause` (pause still allows veto). Revoke stops further proposals but does **not** clear an already-pending root — veto is still required before `activatesAt`.
 
@@ -38,10 +35,12 @@ Honest creators with cumulatives already in an **active** root can still claim t
 **Approach — off-chain global allocator + per-chain escrows.** Deploy identical escrow instances on A and B. An off-chain **budget oracle / allocator** (the existing earnings pipeline) maintains:
 
 \[
-\text{GlobalAvailable} = 10\,000 - \sum_{\text{chains}} \text{activatedCommitted}_c
+\text{GlobalAvailable} = 10\,000 - \sum_{\text{chains}} \bigl(\text{activatedCommitted}_c + \text{pendingReserved}_c\bigr)
 \]
 
-When publishing epoch roots, it assigns `newCommitted` slices such that \(\sum_c (C_c^{\text{new}} - C_c^{\text{old}}) \le \text{GlobalAvailable}\). Each chain’s contract still enforces local solvency against that chain’s deposits. Brands fund each chain with a **working inventory** (e.g. 6k on A, 6k on B) greater than expected local load but the allocator never activates more than 10k globally. Excess local deposits are refundable after campaign end.
+The allocator must keep a **durable reservation ledger**: reserve headroom **before** publishing a pending root on either chain, include outstanding pending proposals (not only activated commitments), and release a reservation only after veto, safe supersession, or confirmed activation accounting. Concurrent publishers otherwise double-spend the same apparent headroom.
+
+When publishing epoch roots, it assigns `newCommitted` slices such that the sum of increases fits inside `GlobalAvailable` after durable reserve. Each chain’s contract still enforces local solvency against that chain’s deposits. Brands fund each chain with a **working inventory** (e.g. 6k on A, 6k on B) greater than expected local load but the allocator never activates more than 10k globally. Excess local deposits are refundable after campaign end.
 
 **What breaks.**
 

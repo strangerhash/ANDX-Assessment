@@ -96,15 +96,18 @@ contract EscrowInvariants is StdInvariant, Test {
         }
     }
 
-    // Exact-equality ghost accounting (scoring: model equals contract, not only inequalities)
+    // Exact-equality ghost accounting — independent model must match deposits, commitments, claims, refunds
     function invariant_exactGhost() public view {
         uint256 n = handler.campaignCount();
         for (uint256 i = 0; i < n; ++i) {
             bytes32 id = handler.campaignIds(i);
-            (,,,, uint256 net,,, uint256 claimed, uint256 refunded) = escrow.campaignState(id);
-            assertEq(net, handler.ghostNet(id));
-            assertEq(claimed, handler.ghostClaimed(id));
-            assertEq(refunded, handler.ghostRefunded(id));
+            (,,,, uint256 net, uint256 active, uint256 pending, uint256 claimed, uint256 refunded) =
+                escrow.campaignState(id);
+            assertEq(net, handler.ghostNet(id), "ghostNet");
+            assertEq(active, handler.ghostActive(id), "ghostActive");
+            assertEq(pending, handler.ghostPending(id), "ghostPending");
+            assertEq(claimed, handler.ghostClaimed(id), "ghostClaimed");
+            assertEq(refunded, handler.ghostRefunded(id), "ghostRefunded");
         }
     }
 

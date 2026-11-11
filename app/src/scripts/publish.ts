@@ -14,7 +14,7 @@ import {
   type Address,
 } from "viem";
 import { foundry } from "viem/chains";
-import { roles, creatorByName } from "../lib/accounts.ts";
+import { roles, creatorByName, assertFixtureAccounts } from "../lib/accounts.ts";
 import { escrowAbi } from "../lib/abi.ts";
 import { buildMerkleTree, saltFromString } from "../lib/merkle.ts";
 
@@ -27,6 +27,7 @@ function campaignIdFor(brand: Address, saltStr: string): Hex {
 }
 
 async function main() {
+  assertFixtureAccounts();
   const dep = JSON.parse(readFileSync(join(ROOT, "deployments.json"), "utf8"));
   const epochsFile = JSON.parse(readFileSync(join(ROOT, "fixtures/epochs.json"), "utf8"));
   const escrow = getAddress(dep.AndxEscrow);

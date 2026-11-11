@@ -10,9 +10,16 @@ Scope: `contracts/src/audit/LegacyPayouts.sol` as if deployed behind an ERC1967 
 
 **Severity:** Critical — uninitialized implementation / re-initialization can seize upgrade authority.  
 **Lines:** `initialize` (54–63), `_authorizeUpgrade` (83).  
-**Scenario:** `initialize` has no `initializer` / `reinitializer` modifier and does not disable initializers in the implementation constructor. An attacker calls `initialize` on the naked implementation (or re-inits if the proxy path is ever exposed), sets themselves as `owner`, and authorizes malicious upgrades via UUPS.  
+**Scenario:** `initialize` has no `initializer` / `reinitializer` modifier and does not disable initializers in the implementation constructor. An attacker calls `initialize` on the naked implementation **or re-initializes the live proxy**, sets themselves as `owner`, upgrades to a drain implementation, and empties proxy-held funds.  
 **Fix:** Use OpenZeppelin `Initializable`, call `_disableInitializers()` in the implementation constructor, and mark `initialize` with `initializer`.  
-**PoC:** `test_C01_uninitializedImplementation_takeover`
+**PoC:** `test_C01_uninitializedImplementation_takeover`, `test_C01_proxyReinitialize_takeoverFunds`
+
+### C-02 — Revoked zero-operator + `ecrecover(address(0))` voucher drain
+
+**Severity:** Critical — after `revokeOperator`, `operator == address(0)`. `_recover` can return `address(0)` for a malformed 65-byte signature; `require(recovered == operator)` then passes. Attacker redeems arbitrary vouchers and drains uncommitted budget.  
+**Lines:** `revokeOperator` 72–75; `redeemVoucher` 177–198; `_recover` 207–218.  
+**Fix:** Reject `operator == address(0)` in `redeemVoucher`; reject `ecrecover == address(0)`; prefer digest-keyed vouchers + low-s.  
+**PoC:** `test_E3_zeroOperator_malformedSigVoucherDrain`
 
 ---
 
@@ -64,10 +71,32 @@ Scope: `contracts/src/audit/LegacyPayouts.sol` as if deployed behind an ERC1967 
 
 ### M-01 — Unchecked `transferFrom` in `topUp`
 
-**Severity:** Medium — non-standard ERC-20s (no return data) or silent failures corrupt accounting.  
+**Severity:** High (economic) / Medium (report class) — tokens that return `false` leave `budget` increased with no tokens pulled, inventing liabilities against shared escrow balances.  
 **Lines:** 106.  
-**Scenario:** Tokens that return `false` instead of reverting leave `budget` increased with no tokens pulled.  
-**Fix:** `SafeERC20.safeTransferFrom`.
+**Scenario:** After a successful `fund`, `topUp` with a false-returning token credits `budget += amount` while the balance is unchanged.  
+**Fix:** `SafeERC20.safeTransferFrom`; credit balance delta only.  
+**PoC:** `test_M01_topUpFalseReturn_inflatesBudget`
+
+### H-06 — Claim does not reduce `budget`; refund steals cross-campaign liquidity
+
+**Severity:** High — `claim` moves tokens but leaves `budget` unchanged. `refund` uses `budget - (committed - claimedTotal)`, so after large claims the brand can refund nearly the full budget and consume other campaigns' deposits in the shared token pool.  
+**Lines:** `claim` 154–166; `refund` 110–119.  
+**Fix:** Decrease `budget` (or track `netDeposited`/`spent`) on payouts; isolate per-campaign balances.  
+**PoC:** `test_S1_crossCampaignRefundTheft`
+
+### H-07 — No aggregate claim vs commitment ceiling
+
+**Severity:** High — `claim` never checks `claimedTotal + payout <= committed`, so a malicious root with oversized leaves drains shared liquidity beyond the campaign's commitment.  
+**Lines:** `claim` 154–166.  
+**Fix:** Enforce `claimedTotal + payout <= committed` (AndxEscrow `ClaimedExceedsCommitted`).  
+**PoC:** `test_F2_claimAboveCommitment_drainsSharedLiquidity`
+
+### H-08 — `fund` reentrancy doubles budget via balance-delta
+
+**Severity:** High — a malicious ERC-20 reenters `fund` inside `transferFrom`. The outer `received = balanceAfter - before` includes the inner deposit, so the outer campaign's `budget` is inflated beyond tokens attributable to that call.  
+**Lines:** `fund` 86–99.  
+**Fix:** ReentrancyGuard; CEI; or non-reentrant token assumptions + checks.  
+**PoC:** `test_F1_fundReentrancy_doubleCredit`
 
 ### M-02 — Refund formula ignores pending commitment semantics / can underflow conceptually
 
@@ -108,7 +137,6 @@ Not an issue by itself.
 
 - Using `abi.encodePacked` for Merkle leaves is brittle with dynamic types but here types are fixed-width — not a collision bug by itself.
 - Anyone can call `activateRoot` after delay — intentional.
-- `revokeOperator` sets operator to zero — stops new roots/vouchers; not a theft path alone.
 
 ---
 
@@ -116,4 +144,6 @@ Not an issue by itself.
 
 **H-01 + M-04:** Operator proposes max commitment (locks refunds even if vetoed) and drains remaining perceived budget via vouchers before veto.  
 **H-02 + H-03:** Fee-gap re-claim plus migration multiplies payouts per leaf.  
-**C-01 + owner powers:** Implementation takeover → upgrade to empty the proxy.
+**C-01 + owner powers:** Proxy re-init → upgrade → drain held funds.  
+**C-02:** Guardian/owner revoke operator “for safety” then anyone drains via zero-signer vouchers.  
+**H-06 + H-07:** Overclaim one campaign and/or refund after claims to empty shared pool used by other brands.

@@ -99,7 +99,11 @@ export class ChaosRpc {
     throw lastErr;
   }
 
-  /** Consistent blocks+logs from one sticky endpoint for the range. */
+  /**
+   * Consistent blocks+logs from one sticky endpoint.
+   * Re-checks head after logs; if the visible tip moved/lagged mid-flight, abort
+   * without returning a range the caller would checkpoint past incomplete logs.
+   */
   async fetchRange(address: Address, fromBlock: bigint, toBlock: bigint) {
     if (toBlock - fromBlock > 199n) throw new Error("log span too large");
 
@@ -118,13 +122,14 @@ export class ChaosRpc {
         const blocks: { number: bigint; hash: Hex; parentHash: Hex }[] = [];
         for (let n = fromBlock; n <= actualTo; n++) {
           const block = await callWithRetry(() => ep.client.getBlock({ blockNumber: n }), 8);
+          if (!block.hash) throw new Error(`missing hash at block ${n}`);
           if (blocks.length > 0) {
             const prev = blocks[blocks.length - 1];
             if (block.parentHash.toLowerCase() !== prev.hash.toLowerCase()) {
               return { blocks, logs: [] as Log[], responseHead: head, reorgAt: prev.number };
             }
           }
-          blocks.push({ number: block.number, hash: block.hash, parentHash: block.parentHash });
+          blocks.push({ number: block.number!, hash: block.hash, parentHash: block.parentHash });
         }
 
         const logs = await callWithRetry(
@@ -136,7 +141,30 @@ export class ChaosRpc {
             }),
           8,
         );
-        return { blocks, logs, responseHead: head };
+
+        // Snapshot check: tip must not have gone *backwards* (lag) after we already
+        // claimed headers through actualTo; otherwise logs may omit tip events.
+        const headAfter = await callWithRetry(() => ep.client.getBlockNumber(), 4);
+        this.noteHead(headAfter);
+        if (headAfter < actualTo) {
+          // Incomplete / stale view — do not let indexer advance past this range.
+          throw new Error(
+            `stale log snapshot: headers through ${actualTo} but headAfter=${headAfter}`,
+          );
+        }
+
+        // If any log cites a block beyond actualTo, reject (inconsistent).
+        for (const log of logs) {
+          if (log.blockNumber != null && log.blockNumber > actualTo) {
+            throw new Error(`log beyond snapshot: ${log.blockNumber} > ${actualTo}`);
+          }
+          if (log.blockHash && !blocks.some((b) => b.hash.toLowerCase() === log.blockHash!.toLowerCase())) {
+            // Log for a hash we did not fetch in this snapshot — retry
+            throw new Error(`log hash not in fetched headers: ${log.blockHash}`);
+          }
+        }
+
+        return { blocks, logs, responseHead: headAfter >= head ? headAfter : head };
       } catch (e) {
         lastErr = e;
       }

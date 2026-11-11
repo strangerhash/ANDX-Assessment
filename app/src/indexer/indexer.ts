@@ -74,6 +74,10 @@ export class Indexer {
 
     // Continuity check on a single freshest endpoint
     const { block, responseHead } = await this.rpc.getBlock(headBlock);
+    if (!block.hash) {
+      // Missing hash = incomplete RPC view; retry next tick
+      return;
+    }
     if (lowerHex(block.hash) !== lowerHex(headHash)) {
       if (responseHead >= this.rpc.maxSeenHead) {
         await this.reorg(headBlock);
@@ -101,6 +105,7 @@ export class Indexer {
       }
       const { block, responseHead } = await this.rpc.getBlock(n);
       if (responseHead < this.rpc.maxSeenHead) return;
+      if (!block.hash) return;
       if (lowerHex(block.hash) === lowerHex(db.rows[0].hash)) {
         const client = await this.pool.connect();
         try {

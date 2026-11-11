@@ -11,7 +11,7 @@ import {
   getAddress,
 } from "viem";
 import { foundry } from "viem/chains";
-import { roles } from "../lib/accounts.ts";
+import { roles, assertFixtureAccounts } from "../lib/accounts.ts";
 import { readFileSync } from "node:fs";
 
 const RPC = process.env.ANVIL_RPC ?? "http://127.0.0.1:8545";
@@ -23,6 +23,7 @@ function readForge(contractFile: string, contractName: string) {
 }
 
 async function main() {
+  assertFixtureAccounts();
   const owner = roles.owner();
   const publicClient = createPublicClient({ chain: foundry, transport: http(RPC) });
   const wallet = createWalletClient({ account: owner, chain: foundry, transport: http(RPC) });

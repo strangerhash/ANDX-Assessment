@@ -6,7 +6,7 @@ import {AndxEscrow} from "../../src/AndxEscrow.sol";
 import {IAndxEscrow} from "../../src/interfaces/IAndxEscrow.sol";
 import {USDX, FOTX, NRT} from "../../src/tokens/MockTokens.sol";
 
-/// @notice Ghost accounting + handlers for stateful invariant tests.
+/// @notice Ghost accounting tracked from known inputs (not copied from campaignState as expected values).
 contract Handler is Test {
     AndxEscrow public immutable escrow;
     USDX public immutable usdx;
@@ -22,7 +22,6 @@ contract Handler is Test {
     uint256[] public creatorPks;
     bytes32[] public campaignIds;
 
-    // Ghost per campaign
     mapping(bytes32 => uint256) public ghostNet;
     mapping(bytes32 => uint256) public ghostActive;
     mapping(bytes32 => uint256) public ghostPending;
@@ -33,10 +32,17 @@ contract Handler is Test {
     mapping(bytes32 => mapping(address => uint256)) public ghostMaxActivatedCum;
     mapping(address => mapping(uint256 => bool)) public ghostNonceUsed;
 
-    // Metrics
+    mapping(bytes32 => mapping(address => uint256)) internal proposedCum;
+    mapping(bytes32 => mapping(address => bytes32)) internal proposedSibling; // 2-leaf proof element
+    mapping(bytes32 => bool) internal pendingListed;
+
+    // Attempt vs success metrics
     uint256 public ghostClaims;
+    uint256 public ghostClaimAttempts;
     uint256 public ghostActivations;
+    uint256 public ghostActivationAttempts;
     uint256 public ghostRefunds;
+    uint256 public ghostRefundAttempts;
     uint256 public ghostProposals;
     uint256 public ghostVetoes;
 
@@ -78,6 +84,9 @@ contract Handler is Test {
         uint256 amount = bound(amountSeed, 1_000_000, 50_000_000);
         bytes32 salt = bytes32(saltSeed);
 
+        // Independent expected received (FOTX burns 1%)
+        uint256 expectedNet = token == address(fotx) ? amount - amount / 100 : amount;
+
         if (token == address(usdx)) usdx.mint(brand, amount);
         else if (token == address(fotx)) fotx.mint(brand, amount);
         else nrt.mint(brand, amount);
@@ -90,8 +99,7 @@ contract Handler is Test {
         try escrow.createCampaign(token, amount, uint64(block.timestamp + 30 days), amount / 2, salt) returns (
             bytes32 id
         ) {
-            (,,,, uint256 net,,,,) = escrow.campaignState(id);
-            ghostNet[id] = net;
+            ghostNet[id] = expectedNet;
             ghostToken[id] = token;
             ghostActive[id] = 0;
             ghostPending[id] = 0;
@@ -107,18 +115,19 @@ contract Handler is Test {
         bytes32 id = campaignIds[campaignSeed % campaignIds.length];
         address creator = creators[creatorSeed % creators.length];
 
-        (,,,, uint256 net, uint256 active,, uint256 claimed, uint256 refunded) = escrow.campaignState(id);
-        (,, uint64 endTime,,,,,,) = escrow.campaignState(id);
+        uint256 net = ghostNet[id];
+        uint256 active = ghostActive[id];
+        uint256 refunded = ghostRefunded[id];
+        (,, uint64 endTime, uint256 maxEpoch,,,,,) = _viewCampaign(id);
         if (block.timestamp >= endTime) return;
 
         uint256 room = net - refunded - active;
         if (room == 0) return;
-        (,,, uint256 maxEpoch,,,,,) = escrow.campaignState(id);
         uint256 maxInc = maxEpoch < room ? maxEpoch : room;
         if (maxInc == 0) return;
 
-        uint256 newCum = bound(cumSeed, 1, maxInc);
         uint256 already = ghostClaimedBy[id][creator];
+        uint256 newCum = bound(cumSeed, 1, maxInc);
         if (newCum <= already) newCum = already + 1;
         if (newCum > active + maxInc) newCum = active + maxInc;
 
@@ -127,7 +136,6 @@ contract Handler is Test {
         if (newCommitted - active > maxEpoch) return;
         if (newCommitted > net - refunded) return;
 
-        // Single-leaf root for simplicity (adversarial may use arbitrary)
         bytes32 root = escrow.leaf(id, creator, newCum);
         bytes32[] memory ids = new bytes32[](1);
         ids[0] = id;
@@ -140,28 +148,21 @@ contract Handler is Test {
         uint64 epoch = uint64(escrow.lastEpoch() + 1);
         vm.prank(operator);
         try escrow.proposeRoot(epoch, root, ids, committed) {
-            ghostPending[id] = newCommitted;
-            ghostMaxActivatedCum[id][creator] = // not yet activated
-                ghostMaxActivatedCum[id][creator];
-            // stash intended cum in leaf via temporary mapping using pending as marker
+            _markPendingListing(ids, committed);
+            proposedCum[id][creator] = newCum;
+            delete proposedSibling[id][creator];
             ghostProposals++;
-            // store proposed cum in ghostClaimedBy underflow sentinel — use separate map
-            _setProposedCum(id, creator, newCum);
         } catch {}
     }
 
-    mapping(bytes32 => mapping(address => uint256)) internal proposedCum;
-
-    function _setProposedCum(bytes32 id, address c, uint256 v) internal {
-        proposedCum[id][c] = v;
-    }
-
+    /// @dev Builds a 2-leaf adversarial tree whose leaf sums can exceed commitment.
     function proposeAdversarial(uint256 campaignSeed, uint256 committedSeed) external {
         if (campaignIds.length == 0) return;
         bytes32 id = campaignIds[campaignSeed % campaignIds.length];
-        (,,,, uint256 net, uint256 active,, , uint256 refunded) = escrow.campaignState(id);
-        (,, uint64 endTime,,,,,,) = escrow.campaignState(id);
-        (,,, uint256 maxEpoch,,,,,) = escrow.campaignState(id);
+        uint256 net = ghostNet[id];
+        uint256 active = ghostActive[id];
+        uint256 refunded = ghostRefunded[id];
+        (,, uint64 endTime, uint256 maxEpoch,,,,,) = _viewCampaign(id);
         if (block.timestamp >= endTime) return;
 
         (uint64 pe,,) = escrow.pendingRoot();
@@ -171,10 +172,16 @@ contract Handler is Test {
         if (room == 0) return;
         uint256 maxInc = maxEpoch < room ? maxEpoch : room;
         if (maxInc == 0) return;
-        uint256 nc = active + bound(committedSeed, 0, maxInc);
-        // Arbitrary non-zero root (adversarial leaves)
-        bytes32 root = keccak256(abi.encode("adv", committedSeed, id));
-        if (root == bytes32(0)) root = bytes32(uint256(1));
+        uint256 nc = active + bound(committedSeed, 1, maxInc);
+
+        address a = creators[0];
+        address b = creators[1];
+        // Each leaf asks for full `nc` → sum 2*nc > commitment; second claim should hit ceiling.
+        uint256 cumA = nc;
+        uint256 cumB = nc;
+        bytes32 leafA = escrow.leaf(id, a, cumA);
+        bytes32 leafB = escrow.leaf(id, b, cumB);
+        bytes32 root = _hashPair(leafA, leafB);
 
         bytes32[] memory ids = new bytes32[](1);
         ids[0] = id;
@@ -184,7 +191,11 @@ contract Handler is Test {
         uint64 epoch = uint64(escrow.lastEpoch() + 1);
         vm.prank(operator);
         try escrow.proposeRoot(epoch, root, ids, committed) {
-            ghostPending[id] = nc;
+            _markPendingListing(ids, committed);
+            proposedCum[id][a] = cumA;
+            proposedCum[id][b] = cumB;
+            proposedSibling[id][a] = leafB;
+            proposedSibling[id][b] = leafA;
             ghostProposals++;
         } catch {}
     }
@@ -192,17 +203,18 @@ contract Handler is Test {
     function activate() external {
         (uint64 pe,, uint64 at) = escrow.pendingRoot();
         if (pe == 0) return;
+        ghostActivationAttempts++;
         if (block.timestamp < at) {
             vm.warp(at);
         }
         try escrow.activateRoot(pe) {
-            // sync ghosts from campaign states
             for (uint256 i = 0; i < campaignIds.length; ++i) {
                 bytes32 id = campaignIds[i];
-                (,,,,, uint256 active, uint256 pend,,) = escrow.campaignState(id);
-                ghostActive[id] = active;
-                ghostPending[id] = pend;
-                // bump max activated for any proposed cum
+                if (pendingListed[id]) {
+                    ghostActive[id] = ghostPending[id];
+                }
+                ghostPending[id] = ghostActive[id];
+                pendingListed[id] = false;
                 for (uint256 j = 0; j < creators.length; ++j) {
                     uint256 pc = proposedCum[id][creators[j]];
                     if (pc > ghostMaxActivatedCum[id][creators[j]]) {
@@ -221,9 +233,8 @@ contract Handler is Test {
         try escrow.vetoRoot(pe) {
             for (uint256 i = 0; i < campaignIds.length; ++i) {
                 bytes32 id = campaignIds[i];
-                (,,,,, uint256 active, uint256 pend,,) = escrow.campaignState(id);
-                ghostActive[id] = active;
-                ghostPending[id] = pend;
+                ghostPending[id] = ghostActive[id];
+                pendingListed[id] = false;
             }
             ghostVetoes++;
         } catch {}
@@ -239,13 +250,24 @@ contract Handler is Test {
 
         (, bytes32 root) = escrow.activeRoot();
         if (root == bytes32(0)) return;
-        // Only works for single-leaf honest proposals matching active root
-        if (escrow.leaf(id, creator, cum) != root) return;
 
-        bytes32[] memory proof = new bytes32[](0);
+        bytes32 leafHash = escrow.leaf(id, creator, cum);
+        bytes32[] memory proof;
+        bytes32 sib = proposedSibling[id][creator];
+        if (sib != bytes32(0)) {
+            // 2-leaf adversarial tree
+            if (_hashPair(leafHash, sib) != root) return;
+            proof = new bytes32[](1);
+            proof[0] = sib;
+        } else {
+            if (leafHash != root) return;
+            proof = new bytes32[](0);
+        }
+
         IAndxEscrow.Claim memory c =
             IAndxEscrow.Claim({campaignId: id, creator: creator, cumulativeAmount: cum});
         uint256 payout = cum - ghostClaimedBy[id][creator];
+        ghostClaimAttempts++;
         vm.prank(creator);
         try escrow.claim(c, creator, proof) {
             ghostClaimedBy[id][creator] = cum;
@@ -263,7 +285,19 @@ contract Handler is Test {
         uint256 cum = proposedCum[id][creator];
         if (cum == 0 || cum <= ghostClaimedBy[id][creator]) return;
         (, bytes32 root) = escrow.activeRoot();
-        if (root == bytes32(0) || escrow.leaf(id, creator, cum) != root) return;
+        if (root == bytes32(0)) return;
+
+        bytes32 leafHash = escrow.leaf(id, creator, cum);
+        bytes32[] memory proof;
+        bytes32 sib = proposedSibling[id][creator];
+        if (sib != bytes32(0)) {
+            if (_hashPair(leafHash, sib) != root) return;
+            proof = new bytes32[](1);
+            proof[0] = sib;
+        } else {
+            if (leafHash != root) return;
+            proof = new bytes32[](0);
+        }
 
         uint256 nonce = nonceSeed;
         IAndxEscrow.ClaimAuth memory auth = IAndxEscrow.ClaimAuth({
@@ -278,9 +312,9 @@ contract Handler is Test {
         bytes32 digest = escrow.hashClaimAuth(auth);
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, digest);
         bytes memory sig = abi.encodePacked(r, s, v);
-        bytes32[] memory proof = new bytes32[](0);
 
         uint256 payout = cum - ghostClaimedBy[id][creator];
+        ghostClaimAttempts++;
         try escrow.claimWithSig(auth, sig, proof) {
             ghostClaimedBy[id][creator] = cum;
             ghostClaimed[id] += payout;
@@ -288,30 +322,33 @@ contract Handler is Test {
             ghostClaims++;
         } catch {}
 
-        // Always attempt replay
         try escrow.claimWithSig(auth, sig, proof) {
-            // should not succeed
-            ghostClaims += 1000000; // poison metric if replay works
+            ghostClaims += 1000000;
         } catch {}
     }
 
     function refund(uint256 campaignSeed) external {
         if (campaignIds.length == 0) return;
         bytes32 id = campaignIds[campaignSeed % campaignIds.length];
-        (address brand,, uint64 endTime,,,,,, ) = escrow.campaignState(id);
+        (address brand,, uint64 endTime,,,,,,) = _viewCampaign(id);
         if (brand == address(0)) return;
         if (block.timestamp < uint256(endTime) + uint256(escrow.ROOT_DELAY())) {
             vm.warp(uint256(endTime) + uint256(escrow.ROOT_DELAY()));
         }
+
+        uint256 reserved = ghostActive[id] > ghostPending[id] ? ghostActive[id] : ghostPending[id];
+        uint256 available = ghostNet[id] - ghostRefunded[id];
+        uint256 expected = available > reserved ? available - reserved : 0;
+
+        ghostRefundAttempts++;
         vm.prank(brand);
         try escrow.refundUnallocated(id) returns (uint256 amount) {
+            // Independent model: refund equals ghost-predicted amount
+            assertEq(amount, expected);
             if (amount > 0) {
                 ghostRefunded[id] += amount;
                 ghostRefunds++;
             }
-            // resync
-            (,,,,,,,, uint256 refunded) = escrow.campaignState(id);
-            ghostRefunded[id] = refunded;
         } catch {}
     }
 
@@ -321,5 +358,38 @@ contract Handler is Test {
 
     function campaignCount() external view returns (uint256) {
         return campaignIds.length;
+    }
+
+    function _markPendingListing(bytes32[] memory ids, uint256[] memory committed) internal {
+        for (uint256 i = 0; i < campaignIds.length; ++i) {
+            pendingListed[campaignIds[i]] = false;
+            ghostPending[campaignIds[i]] = ghostActive[campaignIds[i]];
+        }
+        for (uint256 j = 0; j < ids.length; ++j) {
+            pendingListed[ids[j]] = true;
+            ghostPending[ids[j]] = committed[j];
+        }
+    }
+
+    function _viewCampaign(bytes32 id)
+        internal
+        view
+        returns (
+            address brand,
+            address token,
+            uint64 endTime,
+            uint256 maxCommitPerEpoch,
+            uint256 netDeposited,
+            uint256 activeCommitted,
+            uint256 pendingCommitted_,
+            uint256 claimedTotal,
+            uint256 refunded
+        )
+    {
+        return escrow.campaignState(id);
+    }
+
+    function _hashPair(bytes32 a, bytes32 b) internal pure returns (bytes32) {
+        return a < b ? keccak256(abi.encodePacked(a, b)) : keccak256(abi.encodePacked(b, a));
     }
 }

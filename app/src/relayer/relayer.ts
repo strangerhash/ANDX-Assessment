@@ -5,6 +5,8 @@ import {
   http,
   encodeFunctionData,
   parseGwei,
+  keccak256,
+  getAddress,
 } from "viem";
 import { foundry } from "viem/chains";
 import { privateKeyToAccount } from "viem/accounts";
@@ -12,7 +14,6 @@ import type pg from "pg";
 import { ChaosRpc } from "../rpc/client.ts";
 import { escrowAbi } from "../lib/abi.ts";
 import { readFileSync, existsSync } from "node:fs";
-import { getAddress } from "viem";
 
 type Job = {
   id: number;
@@ -131,23 +132,26 @@ export class Relayer {
         account: this.account,
       });
     } catch (e) {
-      // Already claimed or invalid — mark failed only if clearly terminal
       const msg = String(e);
-      if (msg.includes("NonceUsed") || msg.includes("NothingToClaim") || msg.includes("0x")) {
-        // Check if already paid
-        const claimed = (await this.rpc.writeClient.readContract({
-          address: this.escrow,
-          abi: escrowAbi,
-          functionName: "claimedBy",
-          args: [auth.campaignId, auth.creator],
-        })) as bigint;
-        if (claimed >= auth.cumulativeAmount) {
-          await this.pool.query(
-            `UPDATE andx_relay_jobs SET status='done', error='already claimed', updated_at=now() WHERE id=$1`,
-            [job.id],
-          );
-          return;
-        }
+      const claimed = (await this.rpc.writeClient.readContract({
+        address: this.escrow,
+        abi: escrowAbi,
+        functionName: "claimedBy",
+        args: [auth.campaignId, auth.creator],
+      })) as bigint;
+      if (claimed >= auth.cumulativeAmount) {
+        await this.pool.query(
+          `UPDATE andx_relay_jobs SET status='done', error='already claimed', updated_at=now() WHERE id=$1`,
+          [job.id],
+        );
+        return;
+      }
+      if (/DeadlineExpired|BadProof|BadSignature|CampaignMissing|RecipientZero|FeeTooHigh/i.test(msg)) {
+        await this.pool.query(
+          `UPDATE andx_relay_jobs SET status='failed', error=$2, updated_at=now() WHERE id=$1`,
+          [job.id, msg.slice(0, 500)],
+        );
+        return;
       }
       console.error(`[relayer] sim failed job ${job.id}`, e);
       await sleep(2000);
@@ -180,8 +184,9 @@ export class Relayer {
         transport: http(this.rpc.endpoints[0].url, { timeout: 20_000, retryCount: 0 }),
       });
 
-      let hash: Hex | null = null;
-      let raw: Hex | null = null;
+      // Sign first, persist durable intent, THEN broadcast (crash-safe).
+      let raw: Hex;
+      let hash: Hex;
       try {
         const request = await wallet.prepareTransactionRequest({
           to: this.escrow,
@@ -190,35 +195,12 @@ export class Relayer {
           gasPrice,
           gas: 500_000n,
         });
-        const signed = await wallet.signTransaction(request);
-        raw = signed;
-        hash = await wallet.sendRawTransaction({ serializedTransaction: signed });
+        raw = await wallet.signTransaction(request);
+        hash = keccak256(raw);
       } catch (e) {
-        const msg = String(e);
-        // 504 / lost send — tx may have been broadcast
-        if (msg.includes("504") || msg.includes("timeout") || msg.includes("Gateway")) {
-          await client.query(
-            `UPDATE andx_relay_jobs SET status='submitted', nonce_used=$2, gas_price=$3, raw_tx=$4, updated_at=now() WHERE id=$1`,
-            [job.id, nonce.toString(), gasPrice.toString(), raw],
-          );
-          await client.query("COMMIT");
-          return;
-        }
-        if (msg.includes("nonce too low") || msg.includes("already known")) {
-          await client.query(
-            `UPDATE andx_relay_jobs SET status='submitted', nonce_used=$2, gas_price=$3, raw_tx=$4, updated_at=now() WHERE id=$1`,
-            [job.id, nonce.toString(), gasPrice.toString(), raw],
-          );
-          await client.query("COMMIT");
-          return;
-        }
-        // rollback nonce allocation on hard failure
-        await client.query(`UPDATE andx_relayer_nonce SET next_nonce = $1 WHERE id=1 AND next_nonce = $2`, [
-          nonce.toString(),
-          (nonce + 1n).toString(),
-        ]);
+        // Never signed — roll back nonce allocation with the TX
         await client.query("ROLLBACK");
-        console.error(`[relayer] send failed job ${job.id}`, e);
+        console.error(`[relayer] sign failed job ${job.id}`, e);
         return;
       }
 
@@ -233,10 +215,54 @@ export class Relayer {
     } finally {
       client.release();
     }
+
+    // Broadcast outside the DB transaction; recovery rebroadcasts the same raw_tx.
+    const persisted = await this.pool.query<Job>(`SELECT * FROM andx_relay_jobs WHERE id=$1`, [job.id]);
+    const row = persisted.rows[0];
+    if (!row?.raw_tx) return;
+    try {
+      const wallet = createWalletClient({
+        account: this.account,
+        chain: foundry,
+        transport: http(this.rpc.endpoints[0].url, { timeout: 20_000, retryCount: 0 }),
+      });
+      const sent = await wallet.sendRawTransaction({ serializedTransaction: row.raw_tx as Hex });
+      if (sent && sent !== row.tx_hash) {
+        await this.pool.query(`UPDATE andx_relay_jobs SET tx_hash=$2, updated_at=now() WHERE id=$1`, [
+          job.id,
+          sent,
+        ]);
+      }
+    } catch (e) {
+      const msg = String(e);
+      // 504 / timeout / already known — trackJob will rebroadcast same raw
+      if (
+        msg.includes("504") ||
+        msg.includes("timeout") ||
+        msg.includes("Gateway") ||
+        msg.includes("already known") ||
+        msg.includes("nonce too low")
+      ) {
+        return;
+      }
+      console.error(`[relayer] broadcast failed job ${job.id}`, e);
+    }
   }
 
   private async trackJob(job: Job) {
     if (!this.escrow) return;
+
+    // Prefer on-chain claim state over a single receipt (avoids marking failed after a successful earlier pay).
+    const claimed = (await this.rpc.writeClient.readContract({
+      address: this.escrow,
+      abi: escrowAbi,
+      functionName: "claimedBy",
+      args: [job.campaign_id as Hex, getAddress(job.creator)],
+    })) as bigint;
+    if (claimed >= BigInt(job.cumulative_amount)) {
+      await this.pool.query(`UPDATE andx_relay_jobs SET status='done', updated_at=now() WHERE id=$1`, [job.id]);
+      return;
+    }
 
     if (job.tx_hash) {
       try {
@@ -249,7 +275,7 @@ export class Relayer {
             );
             return;
           }
-          // reverted — defect
+          // Reverted and claim still unpaid — only then fail (not if a prior broadcast already paid).
           await this.pool.query(
             `UPDATE andx_relay_jobs SET status='failed', error='reverted', updated_at=now() WHERE id=$1`,
             [job.id],
@@ -259,18 +285,6 @@ export class Relayer {
       } catch {
         // pending
       }
-    }
-
-    // Check if claim already landed via another path
-    const claimed = (await this.rpc.writeClient.readContract({
-      address: this.escrow,
-      abi: escrowAbi,
-      functionName: "claimedBy",
-      args: [job.campaign_id as Hex, getAddress(job.creator)],
-    })) as bigint;
-    if (claimed >= BigInt(job.cumulative_amount)) {
-      await this.pool.query(`UPDATE andx_relay_jobs SET status='done', updated_at=now() WHERE id=$1`, [job.id]);
-      return;
     }
 
     // Silently dropped or lost: rebroadcast or fee-bump same nonce
@@ -320,11 +334,27 @@ export class Relayer {
             gas: 500_000n,
           });
           const signed = await wallet.signTransaction(request);
-          const hash = await wallet.sendRawTransaction({ serializedTransaction: signed });
+          const hash = keccak256(signed);
+          // Persist replacement before broadcast
           await this.pool.query(
             `UPDATE andx_relay_jobs SET tx_hash=$2, raw_tx=$3, gas_price=$4, updated_at=now() WHERE id=$1`,
             [job.id, hash, signed, newGas.toString()],
           );
+          try {
+            await wallet.sendRawTransaction({ serializedTransaction: signed });
+          } catch (sendErr) {
+            const sm = String(sendErr);
+            if (
+              sm.includes("already known") ||
+              sm.includes("nonce too low") ||
+              sm.includes("504") ||
+              sm.includes("timeout") ||
+              sm.includes("Gateway")
+            ) {
+              return;
+            }
+            throw sendErr;
+          }
         } catch (e2) {
           console.error(`[relayer] bump failed job ${job.id}`, e2);
         }

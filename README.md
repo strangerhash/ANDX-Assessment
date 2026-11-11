@@ -112,6 +112,14 @@ With the mutation present, the suite no longer enforces the commitment ceiling �
 - Broader multi-leaf Merkle trees in invariant claim handlers beyond single-leaf honest claims.
 - Formal verification of commitment monotonicity.
 
+## Remediation branch notes (`fix/assessment-remediation`)
+
+Follow-up to review findings (not yet merged to score baseline):
+- Accounts derived from Anvil mnemonic; Appendix A preflight; Dave = index 10.
+- Relayer persists signed `raw_tx` / nonce / hash **before** broadcast.
+- `fetchRange` rejects stale header/log snapshots (head retreat after headers).
+- DESIGN loss bound includes entitlement **reassignment** (`A − Q`) + `Δ`; two-chain allocator reserves pending.
+
 ## Deliverables
 
 | Doc | Purpose |
